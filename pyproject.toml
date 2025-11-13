@@ -1,0 +1,10 @@
+[project]
+name = "kaggle-chess"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "bbrl>=1.0.1",
+    "configargparse>=1.7.1",
+]
