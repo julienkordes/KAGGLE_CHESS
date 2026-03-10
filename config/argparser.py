@@ -53,10 +53,16 @@ def get_parser():
         "--save_path", type=str, default="experiments/test", help="Path to save the results"
     )
     parser.add_argument(
+        "--checkpoint_path", type=str, default=None, help="Path to load checkpoint from"
+    )
+    parser.add_argument(
         "--trainer", type=str, default="trainer_ppo", help="The trainer to use"
     )
     parser.add_argument(
         "--model", type=str, default="PPO", help="The model to use"
+    )
+    parser.add_argument(
+        "--checkpoint_interval", type=int, default=30, help="Checkpoint interval in minutes"
     )
 
     parser.add_argument("--base_dir", type=str, default=None)
@@ -83,7 +89,7 @@ def get_parser():
     parser.add_argument("--algorithm.batch_size", type=int, default=256)
     parser.add_argument("--algorithm.clip_range", type=float, default=0.2)
     parser.add_argument("--algorithm.clip_range_vf", type=float, default=0.0)
-    parser.add_argument("--algorithm.entropy_coef", type=float, default=2e-7)
+    parser.add_argument("--algorithm.entropy_coef", type=float, default=0.01)
     parser.add_argument("--algorithm.policy_coef", type=float, default=1.0)
     parser.add_argument("--algorithm.beta", type=float, default=5.0)
     parser.add_argument("--algorithm.critic_coef", type=float, default=1.0)

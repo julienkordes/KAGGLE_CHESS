@@ -1,19 +1,21 @@
-from Chessnut import Game
-import random
+from kaggle_environments import make
 
-from utils import material_reward, mobility_reward, win_reward
+def main():
 
-def chess_bot(obs):
-    game = Game(obs.board)
-    moves = list(game.get_moves())
-    best_move = random.choice(moves)
-    best_reward = 0
-    for move in moves:
-        r_mat = material_reward(move, obs.board)
-        r_mob = mobility_reward(move, obs.board)
-        r_win = win_reward(move, obs.board)
-        r = 0.1 * r_mat + 0.01 * r_mob + r_win
-        if r > best_reward:
-            best_reward = r
-            best_move = move
-    return best_move
+    env = make("chess", debug=True)
+
+    result = env.run(["chess_bot.py", "random"])
+    print("Agent exit status/reward/time left: ")
+    # look at the generated replay.json and print out the agent info
+    for agent in result[-1]:
+        print("\t", agent.status, "/", agent.reward, "/", agent.observation.remainingOverageTime)
+    print("\n")
+    # render the game to an HTML file
+    html = env.render(mode="html")
+    with open("game.html", "w") as f:
+        f.write(html)
+
+    print("Game saved to game.html — open it in your browser.")
+
+if __name__ == "__main__":
+    main()

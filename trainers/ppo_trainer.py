@@ -1,30 +1,29 @@
 import torch
+import time
 
 from bbrl.utils.functional import gae
 from bbrl_utils.nn import copy_parameters
 from bbrl.agents import TemporalAgent
-from bbrl_utils.algorithms import iter_partial_episodes
 from models.ppo import PPOPenalty
 from utils import save_checkpoint
 
 
 def run_ppo_penalty(ppo: PPOPenalty, args):
-    cfg = ppo.cfg
 
-    # The old_policy params must be wrapped into a TemporalAgent
+    cfg = ppo.cfg
     t_old_policy = TemporalAgent(ppo.old_policy)
 
-    # Training loop
-    for train_workspace in ppo.iter_partial_episodes():
-        # Run the current policy and evaluate the proba of its action according
-        # to the old policy The old_policy can be run after the train_agent on
-        # the same workspace because it writes a logprob_predict and not an
-        # action. That is, it does not determine the action of the old_policy,
-        # it just determines the proba of the action of the current policy given
-        # its own probabilities
+    last_checkpoint_time = time.time()
+    checkpoint_interval = args.checkpoint_interval * 60
 
-        # Compute the critic value over the whole workspace
+    # -------------------------
+    # MAIN TRAINING LOOP
+    # -------------------------
+    for train_workspace in ppo.iter_partial_episodes():
+        
+        # ---- 1) Critic evaluation ----
         ppo.t_all_critics(train_workspace, t=0, n_steps=cfg.algorithm.n_steps)
+
         ws_terminated, ws_reward, ws_v_value, ws_old_v_value = train_workspace[
             "env/terminated",
             "env/reward",
@@ -32,19 +31,14 @@ def run_ppo_penalty(ppo: PPOPenalty, args):
             "old_critic/v_values",
         ]
 
-        # --- Critic optimization
-
-        # Avoids to extreme V-values (helps stability)
+        # Optional V-clipping (helps stability)
         if cfg.algorithm.clip_range_vf > 0:
-            # Clip the difference between old and new values
-            # NOTE: this depends on the reward scaling
             ws_v_value = ws_old_v_value + torch.clamp(
                 ws_v_value - ws_old_v_value,
                 -cfg.algorithm.clip_range_vf,
                 cfg.algorithm.clip_range_vf,
             )
-
-        # Compute the advantage using the (clamped) critic values
+        # ---- 2) Compute advantages ----
         with torch.no_grad():
             advantage = gae(
                 ws_reward[1:],
@@ -54,92 +48,88 @@ def run_ppo_penalty(ppo: PPOPenalty, args):
                 cfg.algorithm.discount_factor,
                 cfg.algorithm.gae,
             )
-        
-        # Compute the critic loss with TD(0)
-        target = ws_reward[1:] + cfg.algorithm.discount_factor * ws_old_v_value[1:].detach() * (1 - ws_terminated[1:].int())
-        critic_loss = torch.nn.functional.mse_loss(ws_v_value[:-1], target) * cfg.algorithm.critic_coef
+
+        # TD(0) critic target
+        with torch.no_grad():
+            target = ws_reward[1:] + cfg.algorithm.discount_factor * ws_old_v_value[1:] * (1 - ws_terminated[1:].int())
+
+        critic_loss = torch.nn.functional.mse_loss(ws_v_value[:-1], target)
+        critic_loss = critic_loss * cfg.algorithm.critic_coef
+
         ppo.critic_optimizer.zero_grad()
         critic_loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            ppo.critic_agent.parameters(), cfg.algorithm.max_grad_norm
-        )
+        torch.nn.utils.clip_grad_norm_(ppo.critic_agent.parameters(), cfg.algorithm.max_grad_norm)
         ppo.critic_optimizer.step()
-        
-        # --- Policy optimization
 
-        # We store the advantage into the train_workspace
+        # ---- 3) Store advantage in workspace ----
         if cfg.algorithm.normalize_advantage and advantage.shape[1] > 1:
             advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
-        train_workspace.set_full("advantage", torch.cat(
-            (advantage, torch.zeros(1, advantage.shape[1]))
-        ))
 
+        train_workspace.set_full(
+            "advantage",
+            torch.cat((advantage, torch.zeros(1, advantage.shape[1])))
+        )
+
+        # ---- 4) Evaluate old policy probabilities ----
         with torch.no_grad():
-            # Just computes the probability of the old policy's action
-            # to get the ratio of probabilities
-            t_old_policy(
-                train_workspace,
-                t=0,
-                n_steps=cfg.algorithm.n_steps,
-                predict_proba=True,
-                compute_entropy=False,
-            )
-
+            t_old_policy(train_workspace, t=0, n_steps=cfg.algorithm.n_steps, predict_proba=True, compute_entropy=False)
 
         transition_workspace = train_workspace.get_transitions()
+
+        # ===============================================
+        #          PPO OPTIMIZATION EPOCHS
+        # ===============================================
         for opt_epoch in range(cfg.algorithm.opt_epochs):
+
             if cfg.algorithm.batch_size > 0:
-                sample_workspace = transition_workspace.select_batch_n(
-                    cfg.algorithm.batch_size
-                )
+                sample_workspace = transition_workspace.select_batch_n(cfg.algorithm.batch_size)
             else:
                 sample_workspace = transition_workspace
 
-            # Compute the policy loss
-            
-            # Compute the KL divergence
-            ppo.t_kl_agent(sample_workspace, t=0, n_steps = 1)
-            kl = sample_workspace["kl"][0]
-            # Compute the probability of the played actions according to the current policy
-            ppo.train_policy(sample_workspace, t=0, n_steps = 1, predict_proba = True, compute_entropy = True)
-            # We do not replay the action: we use the one stored into the dataset
-            # Note that the policy is not wrapped into a TemporalAgent, but we use a single step
-            #Compute the ratio of action probabilities
-            Ratio = (sample_workspace["current_policy/logprob_predict"] - sample_workspace["old_policy/logprob_predict"][0]).exp().squeeze(0)
-            # Compute the policy loss
-            policy_advantage = sample_workspace["advantage"][0]
+            # Compute KL (monitoring only)
+            ppo.t_kl_agent(sample_workspace, t=0, n_steps=1)
+            kl = sample_workspace["kl"][0].mean()
 
-            policy_loss = (Ratio * policy_advantage - cfg.algorithm.beta  * kl).mean()
+            # ---- 5) Current policy forward ----
+            ppo.train_policy(sample_workspace, t=0, n_steps=1, predict_proba=True, compute_entropy=True)
 
-            loss_policy = -cfg.algorithm.policy_coef * policy_loss
+            # Ratio = new_prob / old_prob
+            log_ratio = sample_workspace["current_policy/logprob_predict"] - sample_workspace["old_policy/logprob_predict"][0]
+            ratio = log_ratio.exp().squeeze(0)
 
-            # Entropy loss favors exploration
-            # Note that the standard PPO algorithms do not have an entropy term, they don't need it
-            # because the KL term is supposed to deal with exploration
-            # So, to run the standard PPO algorithm, you should set cfg.algorithm.entropy_coef=0
-            entropy = sample_workspace["current_policy/entropy"]
-            assert len(entropy) == 1, f"{entropy.shape}"
-            entropy_loss = entropy[0].mean()
-            loss_entropy = -cfg.algorithm.entropy_coef * entropy_loss
+            A = sample_workspace["advantage"][0]
 
-            # Store the losses for tensorboard display
-            ppo.logger.log_losses(critic_loss, entropy_loss, policy_loss, ppo.nb_steps)
-            ppo.logger.add_log("advantage", policy_advantage.mean(), ppo.nb_steps)
+            # ---- 6) PPO clipped loss ----
+            eps = cfg.algorithm.clip_range
 
+            clipped_ratio = torch.clamp(ratio, 1 - eps, 1 + eps)
+            surr1 = ratio * A
+            surr2 = clipped_ratio * A
+
+            policy_loss = -torch.min(surr1, surr2).mean()
+
+            # ---- 7) Entropy bonus ----
+            entropy_loss = -cfg.algorithm.entropy_coef * sample_workspace["current_policy/entropy"][0].mean()
+
+            # ---- 8) Total loss ----
+            loss = cfg.algorithm.policy_coef * policy_loss + entropy_loss
+
+            # Backprop
             ppo.policy_optimizer.zero_grad()
-            loss = loss_policy + loss_entropy
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                ppo.train_policy.parameters(), cfg.algorithm.max_grad_norm
-            )
+            torch.nn.utils.clip_grad_norm_(ppo.train_policy.parameters(), cfg.algorithm.max_grad_norm)
             ppo.policy_optimizer.step()
 
-        # Copy parameters
+
+        # ---- 9) Copy params to old policy ----
         copy_parameters(ppo.train_policy, ppo.old_policy)
         copy_parameters(ppo.critic_agent, ppo.old_critic_agent)
 
-        # Save checkpoint
-        save_checkpoint(ppo, ppo.nb_steps, checkpoint_dir=args.save_path+"/checkpoints")
-        
-        # Evaluate
+        # ---- 10) Checkpoint ----
+        current_time = time.time()
+        if current_time - last_checkpoint_time > checkpoint_interval:
+            save_checkpoint(ppo, ppo.nb_steps, checkpoint_dir=args.save_path + "/checkpoints")
+            last_checkpoint_time = current_time
+
+        # ---- 11) Evaluation ----
         ppo.evaluate()

@@ -13,7 +13,6 @@ from bbrl_utils.nn import setup_optimizer
 class CNN_pred(nn.Module):
     def __init__(self, state_dim, hidden_size, activation, V_agent = False):
         super().__init__()
-        # entrée = observation (ex: 14x8x8)
         self.conv = nn.Sequential(
             nn.Conv2d(state_dim, hidden_size, kernel_size=3, padding=1),
             nn.ReLU(),
@@ -54,7 +53,7 @@ class KLAgent(Agent):
         dist_1_from, dist_1_to = self.model_1.dist(obs)
         dist_2_from, dist_2_to = self.model_2.dist(obs)
         kl_from = torch.distributions.kl.kl_divergence(dist_1_from, dist_2_from)
-        kl_to   = torch.distributions.kl.kl_divergence(dist_1_to, dist_2_to)
+        kl_to = torch.distributions.kl.kl_divergence(dist_1_to, dist_2_to)
         kl_total = kl_from + kl_to
         self.set(("kl", t), kl_total)
 
@@ -122,10 +121,16 @@ class DiscretePolicy(Agent):
                     # Filtrer les coups valides (ignore le padding (-1, -1))
                     legal_valid = legal[(legal[:, 0] != -1) & (legal[:, 1] != -1)]
                     legal_from = legal_valid[:, 0]
-                    legal_to   = legal_valid[:, 1]
+                    legal_to = legal_valid[:, 1]
 
                     # Probabilités pour les coups légaux seulement
                     legal_scores = from_prob[b, legal_from] * to_prob[b, legal_to]
+                    if torch.isnan(legal_scores).any() or (legal_scores < 0).any():
+                        with open("nan_scores.log", "a") as f:
+                            f.write("\n--- BAD SCORES ---\n")
+                            f.write(f"fen={self.get(('env/env_obs/legal_moves', t))[b]}\n")
+                            f.write("------------------\n")
+                            legal_scores = torch.ones_like(legal_scores)
                     legal_scores = legal_scores / legal_scores.sum()  # normalisation
 
                     # Sélection
@@ -140,7 +145,7 @@ class DiscretePolicy(Agent):
                     to_list.append(0)
 
             action_from = torch.tensor(from_list, device=obs.device)
-            action_to   = torch.tensor(to_list, device=obs.device)
+            action_to  = torch.tensor(to_list, device=obs.device)
             self.set(("action", t), torch.stack((action_from, action_to), dim=1))
 
 
@@ -154,7 +159,7 @@ class DiscretePolicy(Agent):
         from_logits, to_logits = self.model(obs)
         from_probs = torch.softmax(from_logits, dim=-1)
         to_probs = torch.softmax(to_logits, dim=-1)
-        return torch.distributions.Categorical(from_probs), torch.distributions.Categorical(to_probs)
+        return from_probs, to_probs
 
 
 class PPOPenalty(EpisodicAlgo):

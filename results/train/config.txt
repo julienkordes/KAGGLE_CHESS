@@ -1,6 +1,8 @@
 save_path results/train/
+checkpoint_path None
 trainer trainer_ppo
 model ppo
+checkpoint_interval 30
 base_dir experiments/train/
 save_best False
 logger.classname bbrl.utils.logger.TFLogger
@@ -21,7 +23,7 @@ algorithm.opt_epochs 10
 algorithm.batch_size 256
 algorithm.clip_range 0.2
 algorithm.clip_range_vf 0.0
-algorithm.entropy_coef 2e-07
+algorithm.entropy_coef 0.01
 algorithm.policy_coef 1.0
 algorithm.beta 5.0
 algorithm.critic_coef 1.0
